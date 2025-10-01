@@ -10,12 +10,15 @@ subprocess.Popen(["unclutter", "--timeout", "0"])
 
 #Define logging method
 ENABLE_LOGGING = False
-LOG_PATH = "/home/pi/Documents/tvplayer_log.txt"
+# LOG_PATH is replaced by LOG_DIR and CURRENT_LOG_FILE
+LOG_DIR = "/home/pi/Documents/tvplayer_logs"
+CURRENT_LOG_FILE = None # Will be set dynamically in main()
+
 def log(message):
-   if ENABLE_LOGGING:  
-    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    with open(LOG_PATH, "a") as f:
-        f.write(f"{timestamp} {message}\n")
+    if ENABLE_LOGGING and CURRENT_LOG_FILE: # Check CURRENT_LOG_FILE is set
+        timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+        with open(CURRENT_LOG_FILE, "a") as f: # Use the dynamic file path
+            f.write(f"{timestamp} {message}\n")
 
 # Define folder structure for channels based on time blocks
 BASE_PATH = "/home/pi/Videos/90s shows"
@@ -168,6 +171,14 @@ def play_commercials():
     log("Commercial break finished.")
 
 def main():
+    global CURRENT_LOG_FILE # Declare use of global variable
+
+    # --- Log Setup: Create a unique log file for this session ---
+    os.makedirs(LOG_DIR, exist_ok=True)
+    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    CURRENT_LOG_FILE = os.path.join(LOG_DIR, f"tvplayer_log_{now_str}.txt")
+    # --- End Log Setup ---
+
     log("=== TV Player Script Started ===")
     while True:
         video_file = None
