@@ -1,241 +1,253 @@
-import os
-import threading
-import time
+import xml.etree.ElementTree as ET
 import random
 import subprocess
-from datetime import datetime
+import time
+import datetime
+import logging
+import sys
+import os
+import glob
+import urllib.parse  # ⬅️ NEW IMPORT for URL encoding
 
-# Hide mouse cursor
-subprocess.Popen(["unclutter", "--timeout", "0"])
+# --- 1. CONFIGURATION ---
 
-#Define logging method
-ENABLE_LOGGING = False
-LOG_DIR = "/home/pi/Documents/tvplayer_logs"
-CURRENT_LOG_FILE = None # Will be set dynamically in main()
+# Base path where your content folders are located
+BASE_CONTENT_PATH = os.path.dirname(os.path.abspath(__file__))
 
-def log(message):
-    if ENABLE_LOGGING and CURRENT_LOG_FILE:
-        timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-        with open(CURRENT_LOG_FILE, "a") as f:
-            f.write(f"{timestamp} {message}\n")
+# Setup logging
+LOG_DIR = os.path.join(BASE_CONTENT_PATH, 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILENAME = datetime.datetime.now().strftime("tvplayer_%Y%m%d_%H%M%S.log")
+LOG_PATH = os.path.join(LOG_DIR, LOG_FILENAME)
 
-# Define folder structure for channels based on time blocks
-BASE_PATH = "/home/pi/Videos/90s shows"
-COMMERCIALS_PATH = "/home/pi/Videos/commercials"
-HOLIDAY_PATH = "/home/pi/Videos/holiday_specials"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logging.info(f"Log file created: {LOG_PATH}")
 
-# Define supported video file extensions
-VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv")
+# --- 2. VLC PLAYBACK COMMAND CONFIGURATIONS ---
 
-# Define schedule times (24-hour format)
-SCHEDULE = {
-    "06:00": "01morning",
-    "12:00": "02afternoon",
-    "17:00": "03evening",
-    "21:00": "04night"
-}
+# ⚠️ Use the flags confirmed to be working: 
+WORKING_VOUT_FLAG = 'x11' 
+WORKING_AOUT_DEVICE = 'sysdefault:CARD=Headphones' 
 
-# Define holiday periods
-HOLIDAYS = {
-    "halloween": ("10-21", "10-31"),
-    "christmas": ("12-15", "12-25")
-}
+# Base flags common to all playback
+BASE_FLAGS = [
+    '--vout', WORKING_VOUT_FLAG, 
+    '--aout', 'alsa', 
+    '--alsa-audio-device', WORKING_AOUT_DEVICE, 
+    '--fullscreen',
+]
 
-# Helper function to read a .urls file and pick one
-def _select_url_from_file(file_path):
-    """Reads a .urls file, selects a random URL, and returns it."""
+# Flags specific to remote streaming (network caching and resilience)
+REMOTE_STREAMING_FLAGS = [
+    '--network-caching', '5000', # Increased cache for resilience
+    '--http-reconnect',           # Force re-connect on stream interruption
+    '--demux-filter', 'demux_ts',
+]
+
+# --- 3. HELPER FUNCTIONS ---
+
+def get_video_duration(file_path):
+    """
+    Placeholder for video duration. Needs an accurate method (like ffprobe) 
+    for real-world use if durations are not in XML.
+    """
+    if file_path.lower().startswith(('http://', 'https://')):
+        return 120.0 # Default 2 minutes for remote
+    
+    return random.randint(60, 300) # Default 1-5 minutes for local
+
+def load_content():
+    """Scans all time-slot folders for XML show manifest files."""
+    content = {
+        'ads': [],
+        'morning': [],
+        'afternoon': [],
+        'evening': []
+    }
+    xml_extension = '*.xml'
+    total_xml_files = 0
+
+    # Scan for XML show manifests in ALL folders
+    for slot_name in content.keys():
+        folder_path = os.path.join(BASE_CONTENT_PATH, slot_name)
+        
+        if os.path.isdir(folder_path):
+            xml_files = glob.glob(os.path.join(folder_path, xml_extension))
+            content[slot_name].extend(xml_files)
+            total_xml_files += len(xml_files)
+
+    logging.info(f"Successfully aggregated {total_xml_files} show manifest XML files.")
+    return content
+
+def get_random_entry_from_xml(xml_file_path):
+    """
+    Picks one random video entry from the specified XML file, using the 
+    <file name='...'> structure.
+    """
     try:
-        with open(file_path, 'r') as f:
-            urls = [line.strip() for line in f if line.strip()]
-        if urls:
-            final_selection = random.choice(urls)
-            log(f"URL list selected: {file_path}, playing URL: {final_selection}")
-            return final_selection
-        else:
-            log(f"URL file is empty: {file_path}. Skipping.")
+        tree = ET.parse(xml_file_path)
+        root = tree.getroot()
+        all_entries = root.findall('.//file')
+        
+        if not all_entries:
+            logging.warning(f"No <file> entries found in {xml_file_path}. Skipping.")
             return None
+            
+        file_element = random.choice(all_entries)
+        
+        file_path = file_element.get('name')
+        length_element = file_element.find('length')
+        
+        if file_path and length_element is not None:
+            try:
+                duration = float(length_element.text)
+                return {'path': file_path, 'duration': duration}
+            except (TypeError, ValueError):
+                logging.error(f"Invalid duration found in {xml_file_path}.")
+                return None
+        else:
+            logging.error(f"Incomplete entry (missing 'name' attribute or <length> tag) in {xml_file_path}.")
+            return None
+            
+    except ET.ParseError:
+        logging.error(f"Failed to parse XML file at {xml_file_path}.")
+        return None
     except Exception as e:
-        log(f"Error reading URL file {file_path}: {e}")
+        logging.error(f"Error processing {xml_file_path}: {e}")
         return None
 
-# Define day or night commercials
-def get_commercials_path():
-    holiday = is_holiday()
-    if holiday:
-        path = f"/home/pi/Videos/commercials_{holiday}"
-        if os.path.exists(path):
-            log(f"Using holiday commercials: {path}")
-            return path  # Use holiday commercials if folder exists
 
-    # Fallback to day/night
-    hour = datetime.now().hour
-    if 6 <= hour < 20:
-        log("Using day commercials")
-        return "/home/pi/Videos/commercials_day"
-    else:
-        log("Using night commercials")
-        return "/home/pi/Videos/commercials_night"
-
-def is_holiday():
-    today = datetime.today().strftime("%m-%d")
-    for holiday, (start, end) in HOLIDAYS.items():
-        if start <= today <= end:
-            return holiday
-    return None
-
-
-def get_current_time_block():
-    now = datetime.now().strftime("%H:%M")
-    for switch_time, block in reversed(list(SCHEDULE.items())):
-        if now >= switch_time:
-            log(f"Current time block: {block}")
-            return block
-    return "night"  # Default fallback
-
-
-def get_video_file():
-    selected_show_path = '/home/pi/Documents/selected_show.txt'
-    # Define acceptable extensions for local files and URL lists
-    # Now includes the common video extensions plus the .urls file
-    ALLOWED_EXTENSIONS = VIDEO_EXTENSIONS + (".urls",)
-
-    # 1. Check for user-selected show first
-    if os.path.exists(selected_show_path):
-        with open(selected_show_path, 'r') as f:
-            selected_video = f.read().strip()
-        
-        # NOTE: User selection always assumes the content is the video file or URL itself
-        if selected_video.startswith('http') or os.path.exists(selected_video):
-            log(f"User-selected show detected: {selected_video}")
-            os.remove(selected_show_path)  # Prevent repeat plays
-            return selected_video
-        else:
-            log("Selected show not found on disk or invalid, ignoring.")
-
-
-    # 2. Check for holiday programming
-    holiday = is_holiday()
-    if holiday:
-        holiday_folder = os.path.join(HOLIDAY_PATH, holiday)
-        if os.path.exists(holiday_folder):
-            # Check for allowed extensions
-            videos = [os.path.join(holiday_folder, f) for f in os.listdir(holiday_folder) if f.lower().endswith(ALLOWED_EXTENSIONS)]
-            if videos:
-                selected = random.choice(videos)
-                
-                # Handle .urls file selection
-                if selected.lower().endswith(".urls"):
-                    return _select_url_from_file(selected)
-                
-                log(f"Holiday programming active: {holiday}, playing {selected}")
-                return selected
-
-    # 3. Fallback to normal schedule
-    time_block = get_current_time_block()
-    time_block_path = os.path.join(BASE_PATH, time_block)
-
-    if os.path.exists(time_block_path):
-        all_videos = []
-        for channel in os.listdir(time_block_path):
-            channel_path = os.path.join(time_block_path, channel)
-            if os.path.isdir(channel_path):
-                # Check for allowed extensions
-                videos = [os.path.join(channel_path, f) for f in os.listdir(channel_path) if f.lower().endswith(ALLOWED_EXTENSIONS)]
-                all_videos.extend(videos)
-
-        if all_videos:
-            selected = random.choice(all_videos)
-            
-            # Handle .urls file selection
-            if selected.lower().endswith(".urls"):
-                return _select_url_from_file(selected)
-            
-            log(f"Scheduled programming selected from block {time_block}: {selected}")
-            return selected
-
-    log("No video file could be selected.")
-    return None  # No video found
-
-def play_video(file_path):
-    # Check for local file path errors only if it does not look like a URL
-    if file_path.startswith('/'): # Heuristic check for local path
-        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-            log(f"Error: Local file does not exist or is empty: {file_path}")
-            return
-
-    log("Stopping any existing VLC instances before playing video...")
-    subprocess.run(["pkill", "-9", "vlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2)  # Allow VLC to fully close
-
-    log(f"Now playing: {file_path}")
+def get_current_slot():
+    """Determines the current time slot based on the Pi's system time."""
+    current_hour = datetime.datetime.now().hour
     
-    # VLC arguments work for both local files and URLs
-    subprocess.run([
-        "cvlc", "--fullscreen", "--vout", "x11", "--play-and-exit", "--no-repeat", "--no-loop",
-        # NOTE: Aspect ratio/crop may not work well or be desired for all streaming URLs
-        "--aspect-ratio=4:3", "--crop=4:3", file_path 
-    ])
+    if 6 <= current_hour < 12:
+        return 'morning'
+    elif 12 <= current_hour < 18:
+        return 'afternoon'
+    else:
+        return 'evening'
 
-    log("Ensuring VLC is stopped after video playback...")
-    subprocess.run(["pkill", "-9", "vlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)  # Short delay to ensure VLC has fully terminated
+def play_video(video_data):
+    """
+    Plays a video file (local or remote) using cvlc.
+    """
+    path = video_data['path']
+    duration = video_data['duration']
+    
+    is_remote = path.lower().startswith(('http://', 'https://'))
+    
+    command = [
+        'cvlc', 
+        '--no-video-title',
+        '--play-and-exit',
+        '--quiet',              
+        '--one-instance',
+    ]
+    
+    if is_remote:
+        # ⬅️ FIX B IMPLEMENTATION: Encode spaces and special characters in the URL path
+        try:
+            parsed_url = urllib.parse.urlparse(path)
+            # Encode the path part, leaving the scheme/netloc intact
+            encoded_path = parsed_url._replace(path=urllib.parse.quote(parsed_url.path)).geturl()
+        except Exception:
+            # Fallback if parsing fails
+            encoded_path = path
 
-def play_commercials():
-    log("Stopping any existing VLC instances before commercials...")
-    subprocess.run(["pkill", "-9", "vlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2)  # Give time for VLC to close completely
+        logging.info(f"START Streaming: {encoded_path} (Duration: {duration:.2f}s)")
+        command.extend(REMOTE_STREAMING_FLAGS)
+        command.extend(BASE_FLAGS)
+        command.append(encoded_path) # Use the encoded path
+    else:
+        local_path = os.path.join(BASE_CONTENT_PATH, path)
+        logging.info(f"START Local Playback: {local_path} (Duration: {duration:.2f}s)")
+        command.extend(BASE_FLAGS)
+        command.append(local_path)
 
-    commercial_folder = get_commercials_path()
-    # Commercials MUST be local files, so we only look for the defined VIDEO_EXTENSIONS
-    commercials = [os.path.join(commercial_folder, f) for f in os.listdir(commercial_folder) if f.lower().endswith(VIDEO_EXTENSIONS)]
+    try:
+        timeout_buffer = duration + 10 
+        logging.info(f"Executing command: {' '.join(command)}")
+        subprocess.run(command, timeout=timeout_buffer, check=True)
+        
+    except subprocess.TimeoutExpired:
+        logging.warning(f"Playback timed out for {path}. VLC hung or took too long.")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Playback FAILED for {path}. Error code: {e.returncode}. Check VLC logs for details.")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during playback of {path}: {e}")
+        
+    logging.info(f"END Playback: {path}")
 
-    if not commercials:
-        log("No commercials found. Skipping commercial break.")
+def run_ad_break(content):
+    """Picks a random ad XML file and plays a random ad from it."""
+    ads_xml_list = content.get('ads', [])
+    if not ads_xml_list:
+        logging.warning("AD BREAK SKIPPED: No ad XML files available.")
         return
 
-    total_commercial_time = 0
-    commercial_duration = 180  # 3 minutes
+    num_ads = min(3, len(ads_xml_list))
+    selected_ads_xmls = random.sample(ads_xml_list, num_ads)
 
-    log("Starting commercial break...")
-    while total_commercial_time < commercial_duration:
-        selected_commercial = random.choice(commercials)
-        log(f"Now playing commercial: {selected_commercial}")
-
-        subprocess.run([
-            "cvlc", "--fullscreen", "--vout", "x11", "--play-and-exit", "--no-repeat", "--no-loop",
-            "--aspect-ratio=4:3", "--crop=4:3", selected_commercial
-        ])
-
-        subprocess.run(["pkill", "-9", "vlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    logging.info(f"AD BREAK: Starting commercial break with {num_ads} random ad manifest(s).")
+    
+    for i, ad_xml_path in enumerate(selected_ads_xmls, 1):
+        ad_data = get_random_entry_from_xml(ad_xml_path)
+        
+        if ad_data:
+            logging.info(f"AD PLAY: Ad #{i} selected from manifest: {os.path.basename(ad_xml_path)}")
+            play_video(ad_data)
+        else:
+            logging.warning(f"AD PLAY: Skipping ad from {os.path.basename(ad_xml_path)} due to entry error.")
+        
         time.sleep(1)
 
-        total_commercial_time += 30  # Estimate per commercial
-
-    log("Commercial break finished.")
+# --- 4. MAIN LOOP ---
 
 def main():
-    global CURRENT_LOG_FILE # Declare use of global variable
+    content_manifest = load_content()
+    
+    if not any(content_manifest.values()):
+        logging.error("FATAL: No XML content manifests found in any folders. Check directory structure.")
+        return
 
-    # --- Log Setup: Create a unique log file for this session ---
-    os.makedirs(LOG_DIR, exist_ok=True)
-    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    CURRENT_LOG_FILE = os.path.join(LOG_DIR, f"tvplayer_log_{now_str}.txt")
-    # --- End Log Setup ---
+    logging.info("TV Channel Simulator initialization complete. Starting loop...")
 
-    log("=== TV Player Script Started ===")
     while True:
-        video_file = None
+        current_slot = get_current_slot()
+        main_show_xml_list = content_manifest.get(current_slot, [])
 
-        while not video_file:
-            video_file = get_video_file()
-            time.sleep(1)
+        logging.info(f"--- SCHEDULER: Slot is {current_slot.upper()} (Hour {datetime.datetime.now().strftime('%H:%M')}) ---")
 
-        if video_file:
-            play_commercials()
-            play_video(video_file)
+        if main_show_xml_list:
+            random_show_xml = random.choice(main_show_xml_list)
+            main_video_data = get_random_entry_from_xml(random_show_xml)
+
+            if main_video_data:
+                logging.info(f"MAIN CONTENT: Selected show {os.path.basename(random_show_xml)} and video {main_video_data['path']}")
+                play_video(main_video_data)
+            else:
+                logging.warning(f"WARNING - Skipped show {os.path.basename(random_show_xml)} due to error or no playable entries.")
+
         else:
-            log("No video found, retrying in 3 seconds...")
-            time.sleep(3)
+            logging.warning(f"WARNING - No show XMLs available for the {current_slot} slot. Falling back to filler (ads).")
+            time.sleep(5) 
+
+        run_ad_break(content_manifest)
+
+        time.sleep(5) 
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("Script manually stopped by user (Ctrl+C). Exiting.")
+        print("\nExiting script.")
