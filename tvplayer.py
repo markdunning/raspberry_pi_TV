@@ -33,14 +33,13 @@ logging.info(f"Log file created: {LOG_PATH}")
 # --- 2. VLC PLAYBACK COMMAND CONFIGURATIONS ---
 
 # ⚠️ Use the flags confirmed to be working: 
-WORKING_VOUT_FLAG = 'x11' 
-WORKING_AOUT_DEVICE = 'sysdefault:CARD=Headphones' 
+WORKING_VOUT_FLAG = 'mmal_vout' 
+#WORKING_AOUT_DEVICE = 'sysdefault:CARD=Headphones' 
 
 # Base flags common to all playback
 BASE_FLAGS = [
-    '--vout', WORKING_VOUT_FLAG, 
-    '--aout', 'alsa', 
-    '--alsa-audio-device', WORKING_AOUT_DEVICE, 
+#    '--vout', WORKING_VOUT_FLAG, 
+#    '--aout', 'alsa', 
     '--fullscreen',
 ]
 
@@ -48,7 +47,7 @@ BASE_FLAGS = [
 REMOTE_STREAMING_FLAGS = [
     '--network-caching', '5000', # Increased cache for resilience
     '--http-reconnect',           # Force re-connect on stream interruption
-    '--demux-filter', 'demux_ts',
+    #'--demux-filter', 'demux_ts',
 ]
 
 # --- 3. HELPER FUNCTIONS ---
@@ -148,7 +147,7 @@ def play_video(video_data):
         'cvlc', 
         '--no-video-title',
         '--play-and-exit',
-        '--quiet',              
+      # '--quiet',              
         '--one-instance',
     ]
     
