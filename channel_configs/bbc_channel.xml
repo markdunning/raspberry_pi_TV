@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<channel
+    name="bbc"
+    start_time="07:00"
+    end_time="01:00"
+    content_root="/home/markd/raspberry_pi_TV/bbc"
+    background_image_source="/home/markd/raspberry_pi_TV/bbc/idents" 
+>
+    <slot name="MORNING_RANDOM" start="07:00" end="12:00" folder="morning" filler_xml="ads/ads_day.xml"/>
+
+    <slot name="AFTERNOON_RANDOM" start="12:00" end="18:00" folder="afternoon" filler_xml="ads/ads_day.xml"/>
+
+    <slot name="EVENING_RANDOM" start="18:00" end="21:00" folder="evening" filler_xml="ads/ads_day.xml"/>
+    
+    <slot name="NIGHT_RANDOM" start="21:00" end="01:00" folder="night" filler_xml="ads/ads_night.xml"/>
+
+</channel>
