@@ -115,18 +115,25 @@ def get_videos_from_xml_file(xml_path):
 
 # schedule_generator.py (Revised assign_random_video)
 
-def assign_random_video(slot_name, content_manifest, channel_content_root, slot_folder):
+def assign_random_video(slot_name, content_manifest, slot_history, channel_content_root, slot_folder):
     """
     Implements Two-Stage Randomization:
-    1. Randomly selects a show/playlist XML file from the folder.
+    1. Randomly selects a show/playlist XML file from the folder, avoiding the last chosen file.
     2. Randomly selects one video from within that XML file.
+    
+    Args:
+        slot_name (str): Name of the current slot.
+        content_manifest (dict): Cache of available XML files per folder.
+        slot_history (dict): Tracks the last chosen XML file path for this folder.
+        channel_content_root (str): Base path for content.
+        slot_folder (str): Folder containing the content XMLs.
     """
 
     # 1. Define the content folder path
     content_folder_path = os.path.join(channel_content_root, slot_folder)
 
-    # --- Manifest Caching Logic ---
-    # We now cache a list of ALL content XML file paths for the slot folder.
+    # --- Manifest Caching Logic (Lists the files) ---
+    # Populate the list of available XML files for this folder if not already cached
     if slot_folder not in content_manifest:
         xml_search_pattern = os.path.join(content_folder_path, '*.xml')
         content_manifest[slot_folder] = glob.glob(xml_search_pattern)
@@ -136,8 +143,26 @@ def assign_random_video(slot_name, content_manifest, channel_content_root, slot_
     if not available_xml_files:
         return None, "NO CONTENT"
 
+    # --- History Check and Filtering (NEW VARIETY LOGIC) ---
+    last_chosen_xml = slot_history.get(slot_folder)
+    
+    # Create a list of files eligible for selection (exclude the last one)
+    eligible_xml_files = [
+        path for path in available_xml_files if path != last_chosen_xml
+    ]
+
+    # Fallback: If no eligible files remain (e.g., only one file exists), use the full list.
+    if not eligible_xml_files:
+        eligible_xml_files = available_xml_files
+        if len(available_xml_files) == 1:
+             print(f"⚠️ Warning: Only one content file found in '{slot_folder}'. Repetition unavoidable.")
+        # If there's more than one file, but we are here, something is odd, but we fallback safely.
+
     # --- STAGE 1: Randomly select a Show XML file ---
-    chosen_xml_path = random.choice(available_xml_files)
+    chosen_xml_path = random.choice(eligible_xml_files)
+    
+    # --- Update History for the next iteration ---
+    slot_history[slot_folder] = chosen_xml_path
 
     # --- STAGE 2: Get all videos from the chosen XML and select one ---
     show_videos = get_videos_from_xml_file(chosen_xml_path)
@@ -145,6 +170,8 @@ def assign_random_video(slot_name, content_manifest, channel_content_root, slot_
     if not show_videos:
         # If the XML file was chosen but contained no videos
         print(f"⚠️ Warning: Chosen XML file {os.path.basename(chosen_xml_path)} contains no valid video entries.")
+        # Clear history if the show was empty, to prevent blocking other shows next time
+        slot_history[slot_folder] = None
         return None, "NO CONTENT"
 
     # Select one video (e.g., one episode) from the list in that XML
@@ -228,6 +255,8 @@ def generate_schedule_for_channel(xml_path, inferred_channel_name, schedule_date
 
     # Global Content Manifest (caches content XML file paths)
     content_manifest = {}
+    # History for variety: tracks the last XML path chosen for each slot folder
+    slot_history = {} 
 
     # --- 1. Iterate and schedule content block-by-block (Dynamic Duration) ---
     while current_datetime < end_time_dt:
@@ -264,6 +293,7 @@ def generate_schedule_for_channel(xml_path, inferred_channel_name, schedule_date
             main_video_data, show_name = assign_random_video(
                 current_slot_name,
                 content_manifest,
+                slot_history, # <-- NEW HISTORY ARGUMENT
                 channel_content_root,
                 current_slot_folder
             )
