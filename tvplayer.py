@@ -1,574 +1,454 @@
+import os
+import sys
+import json
+import datetime
 import subprocess
 import time
 import logging
-import os
-import json 
-from datetime import datetime, timedelta, date, time as dt_time
-from urllib.parse import quote 
+import urllib.parse
+from typing import Dict, Any, Optional, List
 import xml.etree.ElementTree as ET
 import random
-from typing import Dict, Any, Optional, List
-import sys 
 
-# --- Global Configuration ---
-LOG_DIR = "logs"
-SCHEDULE_DIR = "schedule_data" # User specified directory
-CHANNEL_ROOT = os.path.join(os.path.dirname(__file__), 'channel_configs') # User specified directory
-DEFAULT_CHANNEL = 'bbc' # The fallback if no channel is provided on the command line
-# --- Ident Logic Configuration ---
-IDENT_MAX_DURATION_SECONDS = 90 # Use idents for gaps 90 seconds or less
-MANDATORY_IDENT_MAX_SECONDS = 15 # Max time for the forced ident between shows
-# ---------------------------------
+# --- CONFIGURATION & PATHS ---
+# Base path is assumed to be the directory containing this script.
+BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+SCHEDULE_DIR = os.path.join(BASE_PATH, 'schedule_data')
+CHANNEL_STATE_FILE = os.path.join(BASE_PATH, 'current_channel.txt')
+CHANNEL_REQUEST_FILE = os.path.join(BASE_PATH, 'channel_request.txt')
+OVERRIDE_FILE = os.path.join(BASE_PATH, 'override_video.txt')
+CHANNEL_LIST_FILE = os.path.join(BASE_PATH, 'channel_configs', 'channel_list.json')
+LOG_DIR = os.path.join(BASE_PATH, 'logs') # Dedicated log directory
 
-# --- Logging Setup ---
-def setup_logging(channel_name):
-    """Initializes logging and returns the log file path."""
+# --- VLC COMMAND CONSTANTS (Now split into discrete arguments) ---
+VLC_BASE_OPTS = [
+    "cvlc",
+    "--fullscreen", 
+    "--no-video-title-show", 
+    "--play-and-exit", 
+    "--no-repeat", 
+    "--no-loop", 
+    "--http-reconnect", 
+    "--no-skip-frames",
+    # Separating option and value to avoid shell quoting issues
+    "--http-user-agent",
+    "Mozilla/5.0 (compatible; TVPlayer/1.0)" 
+]
+
+CACHE_REMOTE = 5000 
+CACHE_LOCAL = 300  
+
+# --- STATE AND UTILITY FUNCTIONS ---
+
+def setup_logging(channel_name: Optional[str]):
+    """
+    Configures detailed logging to output to a file named 'logs/[Date]_[Time]_[ChannelName].log'.
+    """
+    # 1. Ensure logs directory exists
     os.makedirs(LOG_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    log_file = os.path.join(LOG_DIR, f"{timestamp}_{channel_name}player.log")
     
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(funcName)s: %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
-    logging.info(f"Logging initialized. Output saved to: {log_file}")
-    return log_file
-
-logger = logging.getLogger(__name__)
-
-# --- Helper Functions ---
-
-def load_video_paths_from_xml(xml_path: str) -> List[str]:
-    """
-    Reads the list of video paths from a simple XML file.
-    It expects video paths listed under <file> tags with a 'name' attribute,
-    consistent across idents and filler lists.
-    """
-    paths = []
-    logger.debug(f"Attempting to load XML from: {xml_path}") 
+    # 2. Define dynamic log filename (Includes full time stamp)
+    now = datetime.datetime.now()
+    safe_channel_name = channel_name.replace(' ', '_').replace('/', '_') if channel_name else "default"
+    log_time_stamp = now.strftime('%Y-%m-%d_%H-%M-%S')
+    log_filename = f"{log_time_stamp}_{safe_channel_name}.log"
+    log_file_path = os.path.join(LOG_DIR, log_filename)
     
-    if not os.path.exists(xml_path):
-        logger.warning(f"Video list XML file not found at: {xml_path}")
-        return paths
-        
-    try:
-        tree = ET.parse(xml_path)
-        # Look for the <file> tag and extract the 'name' attribute
-        for element in tree.findall('.//file'): 
-            path = element.get('name')         
-            if path:
-                paths.append(path)
-        
-        if paths:
-            logger.info(f"Successfully loaded {len(paths)} video paths from {xml_path}.")
-        else:
-            logger.warning(f"XML file found at {xml_path} but contained NO valid <file name='...'> elements.")
+    # 3. Configure logging system
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    # 4. Clear existing handlers to prevent duplicate logging if called again
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
             
+    # 5. Add FileHandler
+    try:
+        fh = logging.FileHandler(log_file_path, mode='a')
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
     except Exception as e:
-        logger.error(f"Error loading videos from {xml_path}: {e}")
+        # Fallback to console logging if file setup fails
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            stream=sys.stderr
+        )
+        logger.critical(f"Failed to set up file logging. Using console only. Error: {e}")
+
+    # 6. Add a StreamHandler for console output (helpful if running interactively)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+    logger.info(f"Logging output directed to: {log_file_path}")
+
+
+def load_channel_order() -> List[str]:
+    """Loads the ordered list of channel names."""
+    try:
+        with open(CHANNEL_LIST_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get('channel_order', [])
+    except Exception as e:
+        logging.error(f"Failed to load channel list: {e}")
+        return []
+
+def load_channel_state() -> Optional[str]:
+    """Reads the name of the currently active channel."""
+    try:
+        with open(CHANNEL_STATE_FILE, 'r') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+def save_channel_state(channel_name: str):
+    """Saves the name of the current channel."""
+    try:
+        with open(CHANNEL_STATE_FILE, 'w') as f:
+            f.write(channel_name)
+    except Exception as e:
+        logging.error(f"Failed to save channel state: {e}")
+
+def get_current_schedule_item(channel_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Finds the scheduled program that should be playing right now for the given channel.
+    """
+    now = datetime.datetime.now()
+    schedule_date_str = now.strftime("%Y-%m-%d")
+    schedule_filename = f"{channel_name}_{schedule_date_str}_schedule.json"
+    schedule_path = os.path.join(SCHEDULE_DIR, schedule_filename)
+
+    try:
+        with open(schedule_path, 'r') as f:
+            schedule = json.load(f)
+    except FileNotFoundError:
+        logging.error(f"Schedule file not found for {channel_name} on {schedule_date_str}.")
+        return None
+    except json.JSONDecodeError as e:
+        logging.error(f"Error decoding schedule JSON: {e}")
+        return None
+
+    # Check the schedule against the current time
+    for program in schedule:
+        try:
+            # Parse start time (which is in ISO format)
+            start_dt = datetime.datetime.fromisoformat(program['start_time'])
+            
+            # Calculate end time based on total slot duration
+            slot_duration = program.get('slot_duration_total', 0)
+            end_dt = start_dt + datetime.timedelta(seconds=slot_duration)
+            
+            # Check if 'now' falls in the slot
+            if start_dt <= now < end_dt:
+                return program
+                
+        except (ValueError, KeyError, TypeError) as e:
+            logging.warning(f"Skipping corrupt schedule item: {program} - Error: {e}")
+            continue
+
+    return None
+
+def read_channel_request() -> Optional[str]:
+    """Reads and clears the channel request file."""
+    if os.path.exists(CHANNEL_REQUEST_FILE):
+        try:
+            with open(CHANNEL_REQUEST_FILE, 'r') as f:
+                channel_request = f.read().strip()
+            os.remove(CHANNEL_REQUEST_FILE) # Clear the request
+            return channel_request
+        except Exception as e:
+            logging.error(f"Error reading/clearing channel request: {e}")
+    return None
+
+def read_override_request() -> Optional[str]:
+    """Reads and clears the video override file (used by the TV Guide GUI)."""
+    if os.path.exists(OVERRIDE_FILE):
+        try:
+            with open(OVERRIDE_FILE, 'r') as f:
+                video_path = f.read().strip()
+            os.remove(OVERRIDE_FILE) # Clear the request
+            return video_path
+        except Exception as e:
+            logging.error(f"Error reading/clearing override request: {e}")
+    return None
+
+def load_video_paths_from_xml(xml_full_path: str) -> List[str]:
+    """Reads the list of video paths from an XML file."""
+    paths = []
+    if not xml_full_path or not os.path.exists(xml_full_path):
+        return paths
+    try:
+        tree = ET.parse(xml_full_path)
+        # Assuming simple <file name="path"/> or <video path="path"/>
+        for element in tree.findall('.//file') + tree.findall('.//video'): 
+             path = element.get('name') or element.get('path')
+             if path:
+                 paths.append(path)
+    except ET.ParseError as e:
+        logging.error(f"Error parsing filler XML {xml_full_path}: {e}")
     return paths
 
-def load_channel_config(channel_name: str) -> Optional[Dict[str, Any]]:
+def select_filler_for_gap(filler_xml_path: str, content_root: str) -> Optional[str]:
     """
-    Loads channel configuration, including global ident path and all slot configurations.
+    Selects a random video from the filler XML list.
     """
-    xml_path = os.path.join(CHANNEL_ROOT, f"{channel_name}_channel.xml")
-    
-    if not os.path.exists(xml_path):
-        logger.error(f"Channel configuration XML not found at: {xml_path}")
+    if not filler_xml_path:
         return None
-
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
         
-        config = {
-            'name': root.get('name', channel_name),
-            'ident_xml_name': root.get('ident_xml'), 
-            'content_root': root.get('content_root', ''),
-            'slots': [] # List to hold slot configurations
-        }
-        
-        # Load slot configurations, including the slot-specific filler_xml
-        for slot_element in root.findall('slot'):
-            slot_start_str = slot_element.get('start')
-            slot_end_str = slot_element.get('end')
-            
-            # Convert time strings to datetime.time objects for easy comparison later
-            slot_start_time = datetime.strptime(slot_start_str, '%H:%M').time()
-            slot_end_time = datetime.strptime(slot_end_str, '%H:%M').time()
-            
-            config['slots'].append({
-                'name': slot_element.get('name'),
-                'start_time': slot_start_time,
-                'end_time': slot_end_time,
-                # Slot-specific filler path for fallback content (now includes adverts)
-                'filler_xml_name': slot_element.get('filler_xml'), 
-                'folder': slot_element.get('folder') 
-            })
-            
-        logger.info(f"Loaded channel config for '{channel_name}'. Global Ident: {config['ident_xml_name']} and {len(config['slots'])} slots.")
-        return config
-
-    except Exception as e:
-        logger.error(f"Error loading channel config {xml_path}: {e}")
-        return None
-
-def get_active_slot_config(target_time: dt_time, channel_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Finds the active slot configuration based on the current time.
-    Handles wrap-around slots (e.g., 21:00 to 01:00).
-    """
-    for slot in channel_config['slots']:
-        start_time = slot['start_time']
-        end_time = slot['end_time']
-        
-        # Simple case (start before end, e.g., 07:00-12:00)
-        if start_time < end_time:
-            if start_time <= target_time < end_time:
-                return slot
-        # Wrap-around case (start after end, e.g., 21:00-01:00)
-        else:
-            # Check if time is after start OR before end (crossing midnight)
-            if target_time >= start_time or target_time < end_time:
-                return slot
-                
-    logger.warning(f"Could not find an active slot for time {target_time.strftime('%H:%M')}. Falling back to content root.")
-    # If no slot found (e.g., outside channel broadcast hours), return an empty-ish dict
-    return {'name': 'OUT_OF_SLOT', 'filler_xml_name': None}
-
-def get_interstitial_ident_path(channel_config: Dict[str, Any]) -> Optional[str]:
-    """Finds a random ident using the global ident XML for mandatory inter-show playback."""
-    content_root = channel_config['content_root']
-    ident_xml_name = channel_config.get('ident_xml_name')
+    filler_full_path = os.path.join(content_root, filler_xml_path)
+    available_fillers = load_video_paths_from_xml(filler_full_path)
     
-    if ident_xml_name:
-        ident_xml_path = os.path.join(content_root, ident_xml_name)
-        ident_paths = load_video_paths_from_xml(ident_xml_path)
-        if ident_paths:
-            return random.choice(ident_paths)
-            
-    logger.warning("Mandatory ident skipped as no ident file was found/contained videos.")
+    if available_fillers:
+        return random.choice(available_fillers)
+        
     return None
 
-def get_filler_video_path(gap_duration_seconds: int, channel_config: Dict[str, Any]) -> Optional[str]:
+
+# --- VIDEO PLAYBACK FUNCTION ---
+
+def play_video(video_path: str, content_root: str, max_run_time: float, seek_time: float, enforce_kill: bool) -> float:
     """
-    Selects a short ident for small gaps, or a slot-specific regular filler for longer gaps.
-    The slot-specific filler is now responsible for containing either promos or adverts based on the slot.
-    """
-    content_root = channel_config['content_root']
-    now_time = datetime.now().time()
-    active_slot = get_active_slot_config(now_time, channel_config)
-
-    # Configuration paths
-    ident_xml_name = channel_config.get('ident_xml_name')
-    slot_filler_xml_name = active_slot.get('filler_xml_name')
-    slot_name = active_slot.get('name', 'N/A')
-    
-    # 1. Check for Ident Priority (Short Gap <= 90 seconds)
-    if gap_duration_seconds <= IDENT_MAX_DURATION_SECONDS and ident_xml_name:
-        ident_xml_path = os.path.join(content_root, ident_xml_name)
-        ident_paths = load_video_paths_from_xml(ident_xml_path)
-        
-        if ident_paths:
-            logger.info(f"Gap is short ({gap_duration_seconds}s). Selecting random IDENT from {ident_xml_name}.")
-            return random.choice(ident_paths)
-
-    # 2. Fallback to Slot-Specific Regular Filler (For all other gaps, including long ones)
-    if slot_filler_xml_name:
-        filler_xml_path = os.path.join(content_root, slot_filler_xml_name)
-        filler_paths = load_video_paths_from_xml(filler_xml_path)
-
-        if filler_paths:
-            content_type = "SLOT-SPECIFIC FILLER"
-            if gap_duration_seconds > IDENT_MAX_DURATION_SECONDS:
-                logger.info(f"Gap is long ({gap_duration_seconds}s). Selecting {content_type} (expected advert/promo) from {slot_filler_xml_name} (Slot: {slot_name}).")
-            else:
-                 # This only happens if a short gap was detected but no global ident was available.
-                 logger.warning(f"Gap is short, but no idents found/configured. Using {content_type} as fallback.")
-
-            return random.choice(filler_paths)
-
-    logger.warning("No suitable filler or ident found for this gap/slot.")
-    return None
-
-def load_schedule_for_channel(channel_name, target_date):
-    """
-    Loads and validates the schedule from the JSON file using the provided structure.
-    """
-    # File path format: schedule_data/itv_2025-10-09_schedule.json
-    schedule_file = os.path.join(SCHEDULE_DIR, f"{channel_name}_{target_date.strftime('%Y-%m-%d')}_schedule.json")
-    segments = []
-    
-    try:
-        with open(schedule_file, 'r') as f:
-            raw_schedule = json.load(f)
-
-        for item in raw_schedule:
-            # 1. Reconstruct datetime from ISO format string (e.g., "2025-10-09T07:00:00")
-            start_dt = datetime.fromisoformat(item['start_time'])
-            
-            # 2. Extract core data
-            duration_total = item['slot_duration_total'] # total slot time in seconds
-            
-            # Use path from video_data, which contains the full URL or relative path
-            file_name = item['video_data']['path'] 
-            
-            # Use content_root from the JSON item
-            content_root = item['content_root'] 
-
-            segments.append({
-                'start_dt': start_dt,
-                'duration': duration_total, # Duration is already in seconds
-                'file': file_name,
-                'type': 'MAIN', # Assuming all scheduled video items are MAIN content
-                'start_time_str': start_dt.strftime('%H%M'), 
-                'content_root': content_root
-            })
-            
-        logger.info(f"Loaded {len(segments)} valid program segments for {channel_name} on {target_date.strftime('%Y-%m-%d')}.")
-        return segments
-        
-    except FileNotFoundError:
-        logger.error(f"Schedule file not found: {schedule_file}")
-        return []
-    except Exception as e:
-        logger.error(f"Error loading or parsing schedule JSON: {e}")
-        return []
-
-def play_video(file_path, base_url, offset_minutes, max_run_minutes, enforce_max_run=True):
-    """
-    Plays a video using VLC.
-    
-    :param enforce_max_run: If False (used for MAIN content), the video runs to completion.
+    Plays a video file (local or remote) using VLC.
+    Returns the actual duration the video ran for (in seconds).
     """
     
-    # 1. Determine Full Path/URL (Ensure URL encoding for remote paths)
-    if file_path.lower().startswith(('http://', 'https://')):
-        # This is a remote URL. We must quote (URL encode) any special characters (like spaces) 
-        # while keeping the slashes, colons, and basic URL structure intact.
-        full_path = quote(file_path, safe='/:?=&') 
-    elif file_path.lower().startswith('/'):
-        # Absolute local path
-        full_path = file_path
+    # 1. Determine if the path is a remote URL
+    is_remote = video_path.lower().startswith(('http://', 'https://'))
+    
+    # 2. Determine the full path/URL and the appropriate caching
+    if is_remote:
+        # Remote: Must be URL encoded (e.g., spaces become %20)
+        player_full_path = urllib.parse.quote(video_path, safe=':/%')
+        network_caching = CACHE_REMOTE 
+        logging.info(f"play_video: Using REMOTE caching ({network_caching}ms) for URL: {player_full_path}")
     else:
-        # Relative local path - join with base_url and quote file name
-        quoted_file_path = quote(file_path, safe='/:')
-        full_path = os.path.join(base_url, quoted_file_path).replace("\\", "/")
+        # Local: Use absolute path directly (Popen list handling is robust to spaces)
+        player_full_path = os.path.abspath(os.path.join(content_root, video_path))
+        network_caching = CACHE_LOCAL
+        logging.info(f"play_video: Using LOCAL absolute path for file: {player_full_path}")
 
-    # 2. Start Time Calculation
-    offset_seconds = int(offset_minutes * 60)
+    # 3. Assemble the VLC command (using discrete list elements for robustness)
+    vlc_command_parts = list(VLC_BASE_OPTS) 
     
-    # 3. Build VLC command
-    vlc_command = [
-        'cvlc',
-        '--no-video-title-show',
-        '--play-and-exit',
-        '--no-loop',
-        '--fullscreen',
-        '--network-caching', '1000', 
-        '--http-reconnect',
-        '--no-skip-frames',
-        '--http-user-agent', 'Mozilla/5.0 (compatible; TVPlayer/1.0)',
-    ]
-    
-    if offset_seconds > 0:
-        vlc_command.extend(['--start-time', str(offset_seconds)])
-    
-    # Append the determined full_path/URL
-    vlc_command.append(full_path)
-    
-    max_run_seconds = int(max_run_minutes * 60)
-    start_time_real = time.time()
+    # Add network caching option
+    vlc_command_parts.append("--network-caching")
+    vlc_command_parts.append(str(network_caching))
 
-    # 4. Log the command and start playing
-    logger.info(f"PLAYING: {full_path}. Offset: {offset_minutes:.2f}m, Max Run: {max_run_minutes:.2f}m. Enforce Kill: {enforce_max_run}.")
-    logger.info(f"VLC COMMAND: {' '.join(vlc_command)}")
-    
-    vlc_process = subprocess.Popen(vlc_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    
-    # 5. Wait for the process to finish, with or without timeout
+    if seek_time > 0 and seek_time < 3600:
+        logging.info(f"play_video: CVLC OFFSET: Seeking to {int(seek_time)} seconds (--start-time flag).")
+        # Add start time option
+        vlc_command_parts.append("--start-time")
+        vlc_command_parts.append(str(int(seek_time)))
+    else:
+        logging.info(f"play_video: Seek time is 0 or invalid. Starting video from the beginning.")
+
+
+    # Append the video path/URI as the final argument
+    vlc_command_parts.append(player_full_path)
+    player_command = vlc_command_parts
+
+    # 4. Execute and monitor the video playback
     try:
-        if enforce_max_run:
-            # Enforce max run time (used for fillers/ads/idents/short interstitials)
-            vlc_process.wait(timeout=max_run_seconds)
-            result_code = vlc_process.returncode
-            logger.info(f"VLC process exited naturally with code {result_code}.")
-        else:
-            # Allow video to run to completion (used for main programs)
-            logger.info("Timeout disabled. Allowing video to run to completion.")
-            vlc_process.wait()
-            result_code = vlc_process.returncode
-            logger.info(f"VLC process exited naturally with code {result_code}.")
-
-    except subprocess.TimeoutExpired:
-        # This block ONLY executes if enforce_max_run was True 
-        if enforce_max_run:
-            actual_runtime = (time.time() - start_time_real) / 60.0
-            logger.warning(f"VLC process timed out after {actual_runtime:.2f}m. Forcefully terminating process to maintain schedule.")
-            vlc_process.terminate()
-            vlc_process.wait()
-            result_code = 1 
-        else:
-            logger.error("Unexpected TimeoutExpired error when timeout was disabled.")
-            result_code = 1
-            
-    except Exception as e:
-        logger.error(f"An error occurred while running VLC: {e}")
-        result_code = 1
-
-    finally:
-        if vlc_process.poll() is None:
-            vlc_process.terminate()
-            vlc_process.wait(timeout=5)
-            logger.warning("VLC process cleanup complete.")
-
-    actual_runtime = (time.time() - start_time_real) / 60.0
-    logger.info(f"Video finished. Actual run time: {actual_runtime:.2f}m, VLC exit code: {result_code}")
-    return actual_runtime, result_code
-
-def run_channel_day(channel_name):
-    """The core scheduling logic for playing a day's worth of content, now including gap filling and mandatory idents."""
-    
-    now = datetime.now() # 'now' is our internal clock, tracking the scheduled progress
-    today = now.date()
-    current_time = now.time()
-    
-    # --- Load Channel Config ---
-    channel_config = load_channel_config(channel_name)
-    if not channel_config:
-        logger.error(f"Could not load config for channel '{channel_name}'. Cannot run.")
-        return
-    # --------------------------------
-
-    segments = load_schedule_for_channel(channel_name, today)
-    if not segments:
-        logger.error("No schedule loaded. Exiting.")
-        return
-
-    # Find the current segment index
-    start_index = 0
-    for i, segment in enumerate(segments):
-        # We compare the time component of the expected start datetime
-        if segment['start_dt'].time() <= current_time:
-            start_index = i
-        else:
-            break
-
-    # Determine the name for logging
-    show_name = segments[start_index]['file'].split('/')[-1]
-    logger.info(f"Scheduler starting at index {start_index} ({show_name})")
-    
-    # --- Main Scheduling Loop ---
-    for i in range(start_index, len(segments)):
-        segment = segments[i]
-        expected_start_dt = segment['start_dt']
-        is_first_segment = (i == start_index) # Flag for the very first show played today
-
+        # NOTE: The command is executed as a list of arguments, but logged as a single string 
+        # for easy copy/paste testing in the shell.
+        logging.info(f"VLC COMMAND: {' '.join(player_command)}")
         
-        # Calculate how late we are (or early, if negative)
-        time_diff = now - expected_start_dt
-        late_seconds = time_diff.total_seconds()
-        late_minutes = late_seconds / 60.0
-        
-        # --- Gap Filling Logic (Only applies if we are early/on-time) ---
-        if late_seconds < 0:
-            # We are early (a GAP exists). Fill the gap.
-            gap_seconds = -late_seconds
-            gap_minutes = gap_seconds / 60.0
-            
-            logger.info(f"SCHEDULE GAP DETECTED: {gap_seconds:.2f} seconds.")
-            
-            # --- Select and Play Filler/Advert/Ident to fill the gap ---
-            filler_path = get_filler_video_path(
-                gap_duration_seconds=int(gap_seconds), 
-                channel_config=channel_config
-            )
-
-            if filler_path:
-                # Filler MUST be cut off at the exact scheduled start time
-                
-                # We need to know the *exact* real time the filler started
-                real_start_dt = datetime.now()
-                
-                actual_filler_runtime, exit_code = play_video(
-                    file_path=filler_path,
-                    base_url=channel_config['content_root'], 
-                    offset_minutes=0.0,
-                    max_run_minutes=gap_minutes, # Max run is the duration of the gap
-                    enforce_max_run=True # Always kill filler/advert/ident to hit schedule
-                )
-                
-                # --- NEW DRIFT CORRECTION ---
-                # Calculate the exact real time the filler *should* have ended
-                filler_expected_end_dt = real_start_dt + timedelta(minutes=gap_minutes)
-                
-                # The real time now
-                real_end_dt = datetime.now()
-                
-                # Check if the filler ran short (due to crash or short file length)
-                time_to_sleep = (filler_expected_end_dt - real_end_dt).total_seconds()
-
-                if time_to_sleep > 0.0:
-                    logger.warning(f"FILLER CRASHED/RAN SHORT ({actual_filler_runtime:.2f}m). Remaining gap to fill: {time_to_sleep:.2f} seconds. Waiting to maintain schedule.")
-                    time.sleep(time_to_sleep)
-                
-                # Advance internal clock 'now' to the expected start of the main show
-                now = expected_start_dt 
-                
-            else:
-                # If no filler/ident was found, simply wait for the remainder of the gap.
-                logger.warning(f"No filler found for gap. Waiting {gap_seconds:.2f} seconds.")
-                time.sleep(gap_seconds)
-                now = expected_start_dt # Time is now exactly on schedule
-                
-            # Recalculate late_minutes for the MAIN segment start. Should be 0.0 now.
-            late_minutes = (now - expected_start_dt).total_seconds() / 60.0
-
-        
-        # --- Pre-Slot Logging ---
-        current_show_name = segment['file'].split('/')[-1] 
-        logger.info(f"\n--- START SLOT: {current_show_name} (Type: {segment['type']}) ---")
-        
-        # --- Mandatory Interstitial Ident Logic (Only for segments *after* the first one) ---
-        if segment['type'] == 'MAIN' and not is_first_segment:
-            ident_path = get_interstitial_ident_path(channel_config)
-            
-            if ident_path:
-                ident_duration_minutes = MANDATORY_IDENT_MAX_SECONDS / 60.0 
-                
-                logger.info("MANDATORY IDENT: Playing short ident between MAIN shows.")
-                
-                # --- NEW REAL-TIME TRACKING FOR IDENT ---
-                real_start_dt = datetime.now()
-                ident_expected_end_dt = real_start_dt + timedelta(seconds=MANDATORY_IDENT_MAX_SECONDS)
-                
-                # Play the ident, enforcing max run time to 15s in case the video file is long.
-                actual_ident_runtime, ident_exit_code = play_video(
-                    file_path=ident_path,
-                    base_url=channel_config['content_root'],
-                    offset_minutes=0.0,
-                    max_run_minutes=ident_duration_minutes, 
-                    enforce_max_run=True 
-                )
-                
-                real_end_dt = datetime.now()
-
-                # Check if the ident ran short
-                time_to_sleep = (ident_expected_end_dt - real_end_dt).total_seconds()
-
-                if time_to_sleep > 0.0:
-                    logger.warning(f"IDENT CRASHED/RAN SHORT ({actual_ident_runtime:.2f}m). Remaining gap to fill: {time_to_sleep:.2f} seconds. Waiting to maintain schedule.")
-                    time.sleep(time_to_sleep)
-
-                # Internal clock 'now' must be advanced by the full Ident max duration (15s)
-                now += timedelta(seconds=MANDATORY_IDENT_MAX_SECONDS)
-                
-                # Recalculate late_minutes for MAIN segment start
-                late_minutes = (now - expected_start_dt).total_seconds() / 60.0
-                
-                if late_minutes > 0:
-                    logger.info(f"SCHEDULE DRIFT: Mandatory ident successfully added {late_minutes:.2f}m of lateness before MAIN show.")
-            else:
-                logger.warning("Mandatory ident skipped as no ident file was found/contained videos.")
-        
-        # --- MAIN Segment Playback Logic ---
-        jump_in_offset_m = 0.0
-        max_run_minutes = segment['duration'] / 60.0
-        segment_duration_m = segment['duration'] / 60.0 # Pre-calculate full duration
-        enforce_catch_up = False
-
-        if late_minutes > 0:
-            # We are late. Decide whether to catch up or drift.
-            
-            if segment['type'] != 'MAIN':
-                # NON-MAIN (e.g., ad blocks) must always catch up.
-                enforce_catch_up = True
-                logger.warning(f"LATE: Scheduler is running {late_minutes:.2f} minutes late for this non-MAIN slot (Catch-up mode).")
-            
-            elif is_first_segment:
-                # FIRST MAIN segment MUST catch up (as per the user requirement).
-                enforce_catch_up = True
-                logger.warning(f"LATE: Scheduler is running {late_minutes:.2f} minutes late for FIRST MAIN slot. Applying jump-in offset to catch up.")
-            
-            else:
-                # SUBSEQUENT MAIN segments always start from 0:00 (drift mode - user requirement).
-                logger.warning(f"LATE: Scheduler is running {late_minutes:.2f} minutes late for this SUBSEQUENT MAIN slot. Starting from the beginning (0:00 offset).")
-                jump_in_offset_m = 0.0
-                enforce_catch_up = False # Explicitly clear catch up for drift mode
-
-
-            # If we need to catch up, apply the offset and adjust run time.
-            if enforce_catch_up:
-                jump_in_offset_m = late_minutes
-                remaining_segment_m = segment_duration_m - jump_in_offset_m
-                
-                if remaining_segment_m <= 0:
-                    logger.warning("JUMP-IN EXCEEDS DURATION: Skipping segment entirely.")
-                    # Advance 'now' to the expected end time of the skipped slot
-                    now = expected_start_dt + timedelta(seconds=segment['duration'])
-                    continue 
-                
-                max_run_minutes = remaining_segment_m
-                
-                logger.warning(f"RUN: Calculated jump-in offset of {jump_in_offset_m:.2f}m. New max run time adjusted to {max_run_minutes:.2f}m.")
-
-
-        # --- Play Video ---
-        
-        # MAIN content runs to completion (False) UNLESS we are in catch-up mode 
-        # (first segment or non-MAIN content), where we need to enforce the max_run_minutes cutoff.
-        enforce_kill = (segment['type'] != 'MAIN' or enforce_catch_up)
-        
-        # Use the content root from the loaded JSON segment
-        content_root = segment['content_root']
-        logger.info(f"Segment Content Root: {content_root}")
-
-        actual_runtime, exit_code = play_video(
-            file_path=segment['file'],
-            base_url=content_root,
-            offset_minutes=jump_in_offset_m,
-            max_run_minutes=max_run_minutes,
-            enforce_max_run=enforce_kill
+        player_proc = subprocess.Popen(
+            player_command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
+        logging.info(f"VLC started (PID: {player_proc.pid}) with max_run_time {max_run_time:.2f}s")
 
-        # Update the 'now' time based on the actual duration the video ran
-        # This keeps the internal clock advanced by the actual time passed.
-        now += timedelta(minutes=actual_runtime)
-        logger.info(f"Show finished. Current time advanced to {now.strftime('%H:%M:%S')}")
+        start_time = time.time()
+        
+        while player_proc.poll() is None:
+            elapsed_time = time.time() - start_time
+            
+            # Check for time limit or explicit kill flag
+            if elapsed_time > max_run_time or enforce_kill:
+                logging.warning(f"Video exceeded max run time ({max_run_time:.2f}s) or kill requested. Terminating PID: {player_proc.pid}")
+                player_proc.terminate()
+                time.sleep(0.5)
+                if player_proc.poll() is None:
+                    player_proc.kill() 
+                break
+            
+            time.sleep(1) 
+        
+        # Check how long the video actually ran for
+        actual_run_time = time.time() - start_time
+        logging.info(f"VLC (PID: {player_proc.pid}) finished. Return Code: {player_proc.returncode}. Actual run time: {actual_run_time:.2f}s.")
 
+        # Return the actual run time
+        return actual_run_time 
 
-    logger.info("End of channel schedule for today.")
-
-
-def main_loop():
-    """Starts the channel player, reading channel name from command line arguments."""
-    channel = DEFAULT_CHANNEL
-    
-    # Check if a command line argument was provided (the script name is sys.argv[0])
-    if len(sys.argv) > 1:
-        # Use the first argument as the channel name
-        channel = sys.argv[1].lower()
-        logger.info(f"Overriding default channel. Using channel from command line: '{channel}'")
-
-    log_file = setup_logging(channel)
-    logger.info(f"Starting player with channel: '{channel}'.")
-    
-    today = date.today() 
-    
-    logger.info(f"--- STARTING CHANNEL RUN: '{channel}' on {today.strftime('%Y-%m-%d')} (Mode: LIVE) ---")
-    
-    try:
-        run_channel_day(channel)
-    except KeyboardInterrupt:
-        logger.info("Player stopped by user.")
+    except FileNotFoundError:
+        logging.critical("VLC (cvlc) command not found. Is VLC installed and in your PATH?")
+        return 0.0 # Return 0 run time on failure
     except Exception as e:
-        logger.error(f"A fatal error occurred: {e}", exc_info=True)
+        logging.error(f"Error executing VLC command: {e}")
+        return 0.0 # Return 0 run time on failure
 
+# --- MAIN PLAYER LOGIC ---
 
-if __name__ == "__main__":
-    main_loop()
+def main():
+    
+    # 1. Determine Initial Channel State 
+    current_channel_initial = load_channel_state()
+    channel_order = load_channel_order()
+    
+    # NEW LOGIC: Check for command-line argument (sys.argv[0] is the script name)
+    cli_channel = None
+    if len(sys.argv) > 1:
+        cli_channel = sys.argv[1].strip()
+        
+    # Determine the starting channel: CLI argument > State file > First in order
+    if cli_channel and cli_channel in channel_order:
+        current_channel = cli_channel
+    else:
+        # Fallback logic
+        current_channel = current_channel_initial or (channel_order[0] if channel_order else "No_Channel")
+        
+    # Log if a CLI argument was provided but was invalid
+    if cli_channel and cli_channel not in channel_order:
+        # Note: If channel_order is empty, 'No_Channel' will be set, which is fine
+        if channel_order:
+             logging.warning(f"Invalid channel argument '{cli_channel}' provided. Falling back to state/default: {current_channel}")
+
+    save_channel_state(current_channel)
+
+    # 2. Setup Logging to the correct file path
+    setup_logging(current_channel)
+
+    logging.info(f"--- TV Player Main Loop Starting on channel: {current_channel} ---")
+    
+    if not channel_order:
+        logging.critical("No channels found. Exiting.")
+        sys.exit(1)
+        
+    MIN_GAP_FOR_PLAY = 5 # Minimum seconds required to start playing a video
+
+    while True:
+        
+        # 3. CHECK FOR REQUESTS
+        requested_channel = read_channel_request()
+        if requested_channel and requested_channel in channel_order:
+            if requested_channel != current_channel:
+                logging.info(f"Channel switch requested: {current_channel} -> {requested_channel}")
+                current_channel = requested_channel
+                save_channel_state(current_channel)
+                setup_logging(current_channel)
+                logging.info("Logging reconfigured for new channel.")
+                
+        override_video_path = read_override_request()
+        if override_video_path:
+            logging.info(f"Override video requested: {override_video_path}")
+            play_video(
+                video_path=override_video_path,
+                content_root="", 
+                max_run_time=3600, 
+                seek_time=0,
+                enforce_kill=False 
+            )
+            continue 
+
+        # 4. GET CURRENT SCHEDULE ITEM
+        current_program = get_current_schedule_item(current_channel)
+
+        if not current_program:
+            logging.warning(f"No schedule found for {current_channel} at this time. Sleeping for 60s.")
+            time.sleep(60)
+            continue
+
+        # Extract essential data
+        main_video_path = current_program['video_data']['path']
+        actual_video_duration = current_program['video_data']['duration']
+        slot_duration_total = current_program['slot_duration_total']
+        content_root = current_program['content_root'] 
+
+        # Calculate time remaining in the slot
+        current_slot_start_time = datetime.datetime.fromisoformat(current_program['start_time'])
+        current_slot_end_time = current_slot_start_time + datetime.timedelta(seconds=slot_duration_total)
+        
+        # Calculate time since the scheduled program started (used for seeking)
+        time_since_start = (datetime.datetime.now() - current_slot_start_time).total_seconds()
+        
+        # Total time remaining until the slot *must* end
+        time_to_slot_end_initial = (current_slot_end_time - datetime.datetime.now()).total_seconds()
+        
+        # --- CRITICAL SLOT CHECK ---
+        if time_to_slot_end_initial < 1:
+            logging.info(f"Slot for {main_video_path} is over ({time_to_slot_end_initial:.1f}s remaining). Proceeding to next iteration.")
+            continue 
+
+        # --- A. Play Main Video (Play from start/seek) ---
+        
+        # Maximum time we will allow the main video to run for in this slot
+        max_run_time_for_main = min(actual_video_duration, time_to_slot_end_initial)
+        time_consumed_main = 0.0
+
+        if max_run_time_for_main > MIN_GAP_FOR_PLAY:
+            logging.info(f"Playing Main Video: {main_video_path} (Max run: {max_run_time_for_main:.2f}s). Seeking to {time_since_start:.1f}s.")
+            
+            # play_video returns actual run time
+            time_consumed_main = play_video(
+                video_path=main_video_path, 
+                content_root=content_root,
+                max_run_time=max_run_time_for_main,
+                seek_time=time_since_start, 
+                enforce_kill=False 
+            )
+            
+            # FIX: Check for < 5.0s run time to catch instant VLC failures reliably
+            if time_consumed_main < 5.0 and time_to_slot_end_initial > 60.0:
+                time_remaining_after_fail = time_to_slot_end_initial - time_consumed_main
+                logging.error(f"WARNING: Main video failed instantly. Sleeping until end of slot to prevent re-loop. Wait time: {time_remaining_after_fail:.1f}s.")
+                time.sleep(time_remaining_after_fail)
+                continue # Immediately check for the next program
+                
+        else:
+             logging.info(f"Skipping Main Video: Time remaining ({max_run_time_for_main:.1f}s) too short.")
+
+        
+        # --- B. Handle Filler/Buffer Video ---
+        
+        # Recalculate time remaining based on the amount of time that actually passed during main video attempt
+        time_remaining_in_slot = time_to_slot_end_initial - time_consumed_main
+
+        if time_remaining_in_slot > MIN_GAP_FOR_PLAY:
+            filler_xml_path = current_program.get('filler_xml_path')
+            
+            if filler_xml_path: 
+                
+                filler_video_path = select_filler_for_gap(filler_xml_path, content_root)
+
+                if filler_video_path:
+                    logging.info(f"Playing Filler Video: {filler_video_path} (Gap: {time_remaining_in_slot:.2f}s)")
+                    
+                    # Play filler for the remainder of the slot
+                    play_video(
+                        video_path=filler_video_path,
+                        content_root=content_root,
+                        max_run_time=time_remaining_in_slot,
+                        seek_time=0,
+                        enforce_kill=False
+                    )
+                else:
+                    logging.info(f"No suitable filler found. Waiting for {time_remaining_in_slot:.1f}s until next program.")
+                    time.sleep(time_remaining_in_slot)
+                    
+            else:
+                 logging.info(f"No filler defined. Waiting for {time_remaining_in_slot:.1f}s until next program.")
+                 time.sleep(time_remaining_in_slot)
+        else:
+            logging.info(f"Gap too short ({time_remaining_in_slot:.1f}s). Proceeding to next program.")
+            time.sleep(max(0, time_remaining_in_slot)) # Wait any remaining milliseconds
+
+if __name__ == '__main__':
+    main()
