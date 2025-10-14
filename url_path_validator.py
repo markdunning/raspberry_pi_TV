@@ -6,7 +6,7 @@ import glob
 import argparse
 from typing import List, Dict, Any, Optional, Tuple
 
-# --- Configuration Constants ---
+# --- Configuration Constants (Must be in a runnable file) ---
 SUCCESS_CODES = [200, 301, 302]  # Successful HTTP status codes (OK, Moved, Found)
 TIMEOUT_SECONDS = 10
 # ---------------------
@@ -15,11 +15,8 @@ def discover_and_load_urls(file_paths: List[str]) -> List[Tuple[str, str]]:
     """
     Reads all specified XML files and extracts all video URLs.
 
-    Args:
-        file_paths (list[str]): List of full paths to XML files to process.
-
-    Returns:
-        list[tuple[str, str]]: A list of (url, source_file_name) tuples.
+    The function correctly uses ElementTree to parse the XML and only extracts
+    the 'name' attribute from <file> tags that start with 'http' or 'https'.
     """
     all_urls = []
     
@@ -49,7 +46,7 @@ def discover_and_load_urls(file_paths: List[str]) -> List[Tuple[str, str]]:
 def validate_remote_urls(urls_with_sources: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
     """
     Performs a non-intrusive HEAD request on each URL to check reachability.
-
+    
     Returns:
         list: A list of dictionaries containing the validation report.
     """
